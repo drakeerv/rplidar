@@ -1,7 +1,7 @@
 [package]
 name = "rplidar"
 description = "Driver for Slamtec RPLIDAR series laser sensors"
-version = "0.7.0"
+version = "0.8.0"
 keywords = ["Slamtec", "Rplidar", "Driver"]
 edition = "2021"
 
@@ -14,7 +14,4 @@ byteorder = "1.2"
 crc32fast = "1.4"
 log = "0.4"
 
-[dev-dependencies]
-hex-slice = "0.1"
-serialport = { version = "4.2", default-features = false, features = [] }
 
