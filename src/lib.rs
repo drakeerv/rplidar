@@ -1125,109 +1125,105 @@ where
         );
         let deadline = Instant::now() + timeout;
         let mut first_sync_found = false;
-        let mut scan_start_index = 0; // Index in cache where the current scan frame starts
-
-        loop {
-            if Instant::now() > deadline {
-                warn!("Timeout grabbing full scan frame");
-                return Err(Error::OperationTimeout);
-            }
-
-            let remaining_time = deadline.saturating_duration_since(Instant::now());
-            let read_timeout = std::cmp::min(remaining_time, RPLIDAR_DEFAULT_TIMEOUT / 5);
-            if read_timeout == Duration::ZERO {
-                warn!("Timeout grabbing full scan frame (zero remaining read time)");
-                return Err(Error::OperationTimeout);
-            }
-
-            // Wait for data if cache is empty or doesn't contain points beyond the start index yet
-            if self.cached_measurement_nodes.len() <= scan_start_index && first_sync_found
-                || self.cached_measurement_nodes.is_empty()
-            {
-                trace!("Cache size {} potentially too small (scan_start_index {}), waiting for data (timeout {:?})...", self.cached_measurement_nodes.len(), scan_start_index, read_timeout);
+        let mut scan_points = Vec::with_capacity(RPLIDAR_DEFAULT_CACHE_DEPTH);
+        let mut points_since_last_sync = 0;
+        let max_points_without_sync = 2000; // Adjust based on your LiDAR's expected points per revolution
+        
+        while Instant::now() < deadline {
+            if self.cached_measurement_nodes.is_empty() {
+                let remaining_time = deadline.saturating_duration_since(Instant::now());
+                let read_timeout = std::cmp::min(remaining_time, RPLIDAR_DEFAULT_TIMEOUT / 5);
+                if read_timeout == Duration::ZERO {
+                    break;
+                }
+                
+                trace!("Cache empty, waiting for data (timeout {:?})...", read_timeout);
                 if let Err(e) = self.wait_scan_data_with_timeout(read_timeout) {
                     if !matches!(e, Error::OperationTimeout) {
-                        error!(
-                            "Error during wait_scan_data_with_timeout in grab_scan: {:?}",
-                            e
-                        );
+                        error!("Error during wait_scan_data_with_timeout: {:?}", e);
                         return Err(e);
                     }
                     trace!("wait_scan_data_with_timeout timed out, continuing loop");
+                    continue;
                 }
-                trace!(
-                    "After wait, cache size: {}",
-                    self.cached_measurement_nodes.len()
-                );
-            } else {
-                trace!(
-                    "Cache size {} sufficient (scan_start_index {}), checking for sync bit",
-                    self.cached_measurement_nodes.len(),
-                    scan_start_index
-                );
+                
+                if self.cached_measurement_nodes.is_empty() {
+                    continue;
+                }
             }
-
-            let search_end = self.cached_measurement_nodes.len();
-            let mut next_scan_start_index = scan_start_index;
-            let mut broke_after_first_sync = false;
-
-            for i in scan_start_index..search_end {
-                if self.cached_measurement_nodes[i].is_sync() {
-                    trace!("Found sync bit at index {}", i);
+            
+            // Process all available points in the cache
+            let mut i = 0;
+            while i < self.cached_measurement_nodes.len() {
+                let point = &self.cached_measurement_nodes[i];
+                
+                if point.is_sync() {
+                    trace!("Found sync point at index {}", i);
+                    
                     if !first_sync_found {
-                        trace!("This is the first sync bit found for this frame.");
+                        // First sync point found - start collecting points
                         first_sync_found = true;
-                        next_scan_start_index = i + 1; // Frame data starts after this sync bit
-                        broke_after_first_sync = true;
-                        trace!("Will update scan_start_index to: {}", next_scan_start_index);
-                        break; // Continue outer loop to find the second sync bit
+                        scan_points.clear(); // Reset any previously collected points
+                        
+                        // Remove all points before and including this sync point
+                        self.cached_measurement_nodes.drain(..=i);
+                        i = 0; // Reset index since we've modified the cache
+                        points_since_last_sync = 0;
                     } else {
-                        // Found the second sync bit, marking the end of the frame
-                        let frame_end_index = i;
-                        trace!(
-                            "Found second sync bit at index {}, completing frame (drain {}..{})",
-                            frame_end_index,
-                            0,
-                            frame_end_index
-                        );
-                        let scan_frame: Vec<ScanPoint> = self
-                            .cached_measurement_nodes
-                            .drain(..frame_end_index) // Drain up to (but not including) the second sync bit
-                            .collect();
-                        trace!(
-                            "Drained {} points for the frame. Remaining cache size: {}",
-                            scan_frame.len(),
-                            self.cached_measurement_nodes.len()
-                        );
-                        return Ok(scan_frame); // Exit function with the completed frame
+                        // We found a second sync point after collecting some points
+                        if scan_points.len() >= 50 { // Minimum reasonable number of points for a scan
+                            // Include points up to but not including this sync point
+                            for _ in 0..i {
+                                if let Some(point) = self.cached_measurement_nodes.pop_front() {
+                                    scan_points.push(point);
+                                }
+                            }
+                            trace!("Full scan frame completed with {} points", scan_points.len());
+                            return Ok(scan_points);
+                        } else {
+                            // Too few points between sync signals - this might be a false positive
+                            // or a duplicate sync. Treat this as a new first sync.
+                            trace!("Too few points ({}) between sync signals, treating as new first sync", scan_points.len());
+                            scan_points.clear();
+                            self.cached_measurement_nodes.drain(..=i);
+                            i = 0;
+                            points_since_last_sync = 0;
+                        }
                     }
+                } else if first_sync_found {
+                    // Add point to our scan collection
+                    scan_points.push(self.cached_measurement_nodes[i].clone());
+                    self.cached_measurement_nodes.remove(i);
+                    points_since_last_sync += 1;
+                    
+                    // Safety check - if we've collected a lot of points without seeing a second sync,
+                    // we might have missed a sync signal. Return what we have.
+                    if points_since_last_sync >= max_points_without_sync {
+                        trace!("Collected {} points without finding second sync point, returning anyway", points_since_last_sync);
+                        return Ok(scan_points);
+                    }
+                } else {
+                    // No sync found yet, just advance
+                    i += 1;
                 }
             }
-
-            // Update state after the loop
-            if broke_after_first_sync {
-                scan_start_index = next_scan_start_index;
-                trace!("Updated scan_start_index to {}", scan_start_index);
-            } else if first_sync_found {
-                scan_start_index = search_end;
-                trace!(
-                    "First sync found, but not second in this chunk. Updated scan_start_index to {}",
-                    scan_start_index
-                );
-            }
-
-            // Safety check
-            if self.cached_measurement_nodes.len() > RPLIDAR_DEFAULT_CACHE_DEPTH * 2 {
-                warn!(
-                    "Scan cache grew excessively large ({} points), resetting channel and cache.",
-                    self.cached_measurement_nodes.len()
-                );
-                self.channel.reset();
-                self.cached_measurement_nodes.clear(); // Use clear() instead of new()
-                first_sync_found = false;
-                scan_start_index = 0;
+            
+            // If we get here, we've processed all points in the cache without finding a complete frame
+            if first_sync_found && !scan_points.is_empty() && Instant::now() > (deadline - timeout/10) {
+                // If we're near the timeout and have some points collected, return them
+                trace!("Near timeout with {} points collected, returning partial frame", scan_points.len());
+                return Ok(scan_points);
             }
         }
+        
+        // If we have points but hit the deadline, return what we have
+        if !scan_points.is_empty() {
+            trace!("Timeout reached, returning {} collected points", scan_points.len());
+            return Ok(scan_points);
+        }
+        
+        warn!("Timeout grabbing full scan frame, no points collected");
+        Err(Error::OperationTimeout)
     }
 
     /// Gets the health status of the RPLIDAR device.
